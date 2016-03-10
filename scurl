@@ -1,0 +1,342 @@
+#! /usr/bin/env python
+import sys
+import argparse
+import urlparse
+import re
+import time
+import datetime
+import OpenSSL
+from OpenSSL import SSL
+from socket import socket
+
+##global variables
+crl_serials = None
+cacert = None
+stale_extension = 0 
+pinned = None
+
+class MyParser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write('error\n')
+        sys.exit(2)
+
+#parse input
+def get_args():
+
+	parser = MyParser()
+
+	##argument for tls method
+	method = parser.add_mutually_exclusive_group()
+	method.add_argument('--tlsv1.0', action = 'store_const', dest = 'method', const = SSL.TLSv1_METHOD)
+	method.add_argument('--tlsv1.1', action = 'store_const', dest = 'method', const = SSL.TLSv1_1_METHOD)
+	method.add_argument('--tlsv1.2', action = 'store_const', dest = 'method', const = SSL.TLSv1_2_METHOD)
+	method.add_argument('--sslv3', action = 'store_const', dest = 'method', const = SSL.SSLv3_METHOD)
+	method.add_argument('-3', action = 'store_const', dest = 'method', const = SSL.SSLv3_METHOD)
+	
+	##argument for cipher
+	parser.add_argument('--ciphers', type = str)
+
+	#argument for crl file
+	parser.add_argument('--crlfile', type = file)
+
+	##argument for cacert file location
+	parser.add_argument('--cacert', type = file)
+
+	##argument for stale certs
+	parser.add_argument('--allow-stale-certs',type = positive)
+
+	##argument for --pinnedpublickey
+	parser.add_argument('--pinnedpublickey', type = file)
+
+	##argument for the url
+	parser.add_argument('URL', type = valid_HTTPS, help = 'url to request')
+
+	parser.set_defaults(method=SSL.TLSv1_METHOD)
+	
+	try:
+		
+		try:
+			args, unknown = parser.parse_known_args()
+		except SystemExit:
+			exit(1)
+		if unknown:
+			sys.stderr.write("unknown args\n")
+			exit(1)
+		return args
+	except Exception, e:
+		sys.stderr.write("Failed parsing arguments\n")
+		exit(1)
+
+## citing: http://www.binarytides.com/receive-full-data-with-the-recv-socket-function-in-python/
+def recv_timeout(the_socket,timeout=2):
+    
+    #make socket non blocking
+    the_socket.setblocking(0)
+     
+    #total data partwise in an array
+    total_data=[];
+    data='';
+     
+    #beginning time
+    begin=time.time()
+    while 1:
+        #if you got some data, then break after timeout
+        if total_data and time.time()-begin > timeout:
+            break
+         
+        #if you got no data at all, wait a little longer, twice the timeout
+        elif time.time()-begin > timeout*2:
+            break
+         
+        #recv something
+        try:
+            data = the_socket.recv(8192)
+	    if data:
+                total_data.append(data)
+                #change the beginning time for measurement
+                begin=time.time()
+            else:
+                #sleep for sometime to indicate a gap
+                time.sleep(0.1)
+        except:
+            pass
+     
+    #join all parts to make final string
+    return ''.join(total_data)
+
+
+##check if any serial in cert chain is in crl
+def check_crl(cert):
+	
+	if not crl_serials:
+		return True
+	current_serial = str(cert.get_serial_number())
+	if current_serial in crl_serials:
+		return False
+	return True
+
+def custom_match(host, name):
+	if name[0] == '*':
+		name = name[1:]
+		host = host[host.find('.'):]
+	return name == host
+
+##check if the certificate matches the host
+def check_match(cert, host):
+
+	##obtain alternate name index if it exists
+	alternate_index = -1
+	for i in range(cert.get_extension_count()):
+		if cert.get_extension(i).get_short_name() == "subjectAltName":
+			alternate_index = i
+			break
+	
+	##check if altnames match the host name
+	if alternate_index != -1:
+		alt_ext = cert.get_extension(i)
+		alternate_names = alt_ext._subjectAltNameString()
+		alternate_names = alternate_names.replace(" ", "").replace("DNS:", "").split(",")
+		alternate_matches = [custom_match(host, alternate_names[i]) for i in range(len(alternate_names))]
+		if True in alternate_matches:
+			return True
+	
+	##obtain common name
+	common_name = cert.get_subject().commonName.decode()
+
+	##determine if common names match host
+	common_match = custom_match(host, common_name)
+
+	if not common_match:
+		sys.stderr.write("No common name or alternative certificate subject name matches target host name: " + str(host) + " \n")
+		exit(1)
+
+def positive(value):
+    ivalue = int(value)
+    if ivalue < 0:
+	sys.stderr.write("Please enter a positive value for Stale \n")
+	exit(1)
+    return ivalue
+
+
+##parse URL
+def valid_HTTPS(URL):
+	parsed = urlparse.urlparse(URL)
+	if parsed.scheme == 'https':
+		return parsed
+	sys.stderr.write('Please enter a valid https URL. \n')
+	exit(1)
+
+def strip_header(response):
+	end_header = response.find("\r\n\r\n")+4
+	stripped = response[end_header:]
+	return stripped
+
+##check if a cert has expired, relative to stale_extension
+def check_expired(cert):
+	not_after = cert.get_notAfter()
+	formatted_exp_date = datetime.datetime.strptime(not_after, "%Y%m%d%H%M%SZ")
+	today = datetime.datetime.now()
+	delta = today - formatted_exp_date
+	return delta.days < stale_extension
+
+##callback used to verify
+def callback(conn, cert, errno, depth, result):
+
+	##check if pinned set
+	if pinned:
+		return True
+
+	##check if the certificate has been revoked
+	if check_crl(cert):
+		next
+	else:
+		return False
+
+	##check for allow-stale-certs
+	if errno == 10:
+		has_expired = check_expired(cert)
+		return has_expired
+	return result
+
+def setup(args):
+	
+	##create SSL context
+	context = SSL.Context(args.method) 
+
+	##setup the optional flags (cacert etc)	
+	setup_globals(args, context)
+	
+	##set up verification (with call back)
+	context.set_verify(SSL.VERIFY_PEER | SSL.VERIFY_FAIL_IF_NO_PEER_CERT, callback)
+	
+	##wrap socket around context and perform handshake
+	sock = socket()
+	ssl_sock = SSL.Connection(context, sock)
+	port = 443
+	if args.URL.port:
+		port = args.URL.port
+	ssl_sock.connect((args.URL.hostname, port ))
+	ssl_sock.set_tlsext_host_name(args.URL.hostname)
+	try:
+		ssl_sock.do_handshake()
+	except Exception, e:
+		sys.stderr.write("error on handshake\n")
+		exit(1)
+	return ssl_sock
+
+
+##set stale extension and crl file
+def setup_globals(args, context):
+
+	global stale_extension
+	global crl_serials
+	global pinned
+	
+	##add ciphers if they exist
+	if args.ciphers:
+		try:
+			context.set_cipher_list(args.ciphers)
+		except Exception, e:
+			sys.stderr.write("Please enter a valid cipher list\n")
+			exit(1)
+	
+	##load cacert if it exists, otherwise load defaults
+	if args.cacert:
+		try:
+			context.load_verify_locations(args.cacert.name)
+		except Exception, e:
+			sys.stderr.write("Please enter a valid cacert file\n")
+			exit(1)
+	else:
+		context.set_default_verify_paths()
+
+	##load pinnedpublickey if it exists
+	if args.pinnedpublickey:
+		try:
+			pinned = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, args.pinnedpublickey.read())
+		except Exception, e:
+			sys.stderr.write("Please enter a valid pinned public key file\n")
+			exit(1)	
+	
+	##set stale cert length if it exists
+	if args.allow_stale_certs:
+		stale_extension = args.allow_stale_certs
+	
+	##set the crlfile serials if they exists
+	if args.crlfile:
+		crlfile = args.crlfile		
+		try:
+			##load crl
+			crl_data = crlfile.read()
+			crl_loaded = OpenSSL.crypto.load_crl(OpenSSL.crypto.FILETYPE_PEM, crl_data)
+			crl_revoked = crl_loaded.get_revoked()
+			crl_serials = [str(int(revokee.get_serial(),16)) for revokee in crl_revoked]
+		except Exception, e:
+			sys.stderr.write("Please enter a valid crl file\n")
+			exit(1)
+
+def final_verify(sock,args):
+	
+	##obtain peer cerificate 
+	cert = sock.get_peer_certificate()
+	
+	##check for pinned key and compare to leaf cert
+	if pinned:
+		pinned_digest = pinned.digest("sha256")
+		cert_digest = cert.digest("sha256")
+		if cert_digest != pinned_digest:
+			sys.stderr.write("certificate doesn't match pinned\n")
+			exit(1)
+	
+	##confirm that the hostname matches the common name or an alternate name
+	check_match(cert, args.URL.hostname)
+
+##prints the HTML
+def GET(sock, args):
+	
+	#Send some data to remote server
+	if args.URL.path:
+		message = "GET " + args.URL.path+  " HTTP/1.0\r\n" + "HOST: " + args.URL.hostname + "\r\n" + "User-Agent: curl/7.35.0\r\n"  + "Connection: close\r\n\r\n"
+	else:
+		message = "GET /" + " HTTP/1.0\r\n" + "HOST: " + args.URL.hostname + "\r\n" + "User-Agent: curl/7.35.0\r\n" + "Connection: close\r\n\r\n"
+	try:
+	    sock.send(message)
+	except socket.error:
+	    sys.stderr.write("bad http request")
+	    exit(1)
+	
+	data = recv_timeout(sock)
+	sys.stdout.write(strip_header(data))	
+
+def main():
+
+	try:
+		#get input from the user
+		args = get_args()
+	except SystemExit:
+		exit(1)
+
+	##set up context,socket, and perform handshake
+	try:
+		sock = setup(args)
+	except Exception,e:
+		sys.stderr.write("unable to connect\n")
+		exit(1)
+
+	##check for pinnedpublic key and that the hostname matches com/alt name
+	final_verify(sock,args)
+		
+	##print the html
+	GET(sock,args)	
+
+	##free socket
+	sock.close()
+
+	#exit safely
+	exit(0)
+
+	
+
+if __name__ == "__main__":
+	main()
+t init
