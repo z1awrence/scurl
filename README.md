@@ -19,6 +19,6 @@ Simply run ./scurl --some-flag https://www.example.com in terminal to obtain the
 and (b) C expired within the past N days. The argument N to this option must be a nonnegative
 integer. If this option is used several times, the last one will be used.
 
-• --pinnedpublickey <filename> 
+• --pinnedpublickey <filename> Refused any URL in which the leaf certificate's digest doesn't match the pinned key's.
 
 See the curl manpage for more details on any of the flags.
