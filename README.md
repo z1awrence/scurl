@@ -4,6 +4,7 @@ Standard curl has many vulnerabilities, most of which are certificate verificati
 I will soon update the repo to contain my test files.
 
 Simply run ./scurl --some-flag https://www.example.com in terminal to obtain the html for a page. I list the valid flags and their meaning below:
+
 • --tlsv1.0, --tlsv1.1, --tlsv1.2, --sslv3, -3 . Runs TLSv1.2 by default
 
 • --ciphers. Which ciphers to use in connection. I.E. 
